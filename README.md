@@ -1,5 +1,5 @@
 # nlp-movie-reviews-analysis
-Rus: Цель проведённого исследования заключалась в многоуровневом анализе корпуса англоязычных кинорецензий с платформы Rotten Tomatoes, с разделением материалов на положительные («Fresh») и отрицательные («Rotten») оценки.
+Rus: Цель проведённого исследования заключалась в многоуровневом анализе корпуса англоязычных кинорецензий с платформы Rotten Tomatoes, с разделением материалов на положительные («Fresh») и отрицательные («Rotten») оценки. _**Выполнен на языке программирования R.**_
 
 **1. Project Overview**:
 This project analyzes movie reviews from Rotten Tomatoes to understand how textual features relate to review sentiment (Fresh vs Rotten).
