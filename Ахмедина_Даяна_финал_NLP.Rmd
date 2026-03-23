@@ -1,0 +1,569 @@
+---
+title: "Final project"
+author: "Akhmedina Dayana"
+date: "`09/08/2025"
+output: 
+  html_document:
+    df_print: paged
+    code_folding: show
+    theme: journal
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Загрузка-пакетов, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(dplyr)
+library(data.table)
+library(quanteda)
+library(quanteda.textmodels)
+library(tidytext)
+library(textstem) 
+library(textdata)
+library(tokenizers)
+library(topicmodels)
+library(ggplot2)
+library(wordcloud)
+library(glmnet)
+library(caret)
+library(stopwords)
+library(patchwork)
+library(quanteda.textstats)
+library(SentimentAnalysis)
+library(tm)  
+library(caret)
+```
+
+# Загрузка и проверка данных
+
+```{r Загрузка и проверка данных}
+
+# Загрузка данных
+reviews <- fread("rotten_tomatoes_critic_reviews.csv")
+movies <- fread("rotten_tomatoes_movies.csv")
+
+# Создание уникального ID для отзывов
+reviews <- reviews %>%
+  mutate(review_id = row_number())
+
+# Объединение данных
+combined_data <- reviews %>%
+  inner_join(movies, by = "rotten_tomatoes_link") %>%
+  select(review_id, movie_title, review_type, review_content, 
+         genres, tomatometer_rating, audience_rating, top_critic) %>% 
+  sample_n(10000) 
+
+# Проверка структуры данных
+glimpse(combined_data)
+
+# Анализ распределения типов отзывов
+review_type_distribution <- combined_data %>%
+  dplyr::count(review_type) %>%
+  mutate(percent = n / sum(n) * 100)
+
+print(review_type_distribution)
+
+```
+
+# Очистка и подготовка текста
+
+```{r}
+# генерация стоп слов
+generate_custom_stopwords <- function(data) {
+  # Базовый список стоп-слов
+  base_stopwords <- stopwords("en")
+  
+  # Кино-специфичные термины
+  movie_terms <- c("film", "movie", "can", "may", "will", "just", "make", 
+                       "even", "one", "see", "also", "still", "much", "way",
+                       "get", "say", "character", "scene", "time",
+                       "film", "movie", "cinema", "picture", "feature", 
+                    "flick", "review", "director", "directed", "writer", 
+                  "performance", "actor", "actress", "character", 
+                   "audience", "scene", "screen", "story", "plot",
+                  "like", "good", "find", "seem", "work", "know", "come", "man", 
+                     "something", "end", "take", "give", "make", "look", "really", "see", "get",
+                     "new", "never", "enough", "great", "last", "need", "keep", "right",
+  "become", "two", "many", "think", "little", "leave", "woman", "bring",
+  "though", "full", "year", "another", "try", "thing", "lead", "want",
+  "along", "big", "ever", "long", "perhaps", "first", "second",
+    "yet", "nothing", "day", "often", "whose", "without", "far", "kind",
+  "sometimes", "truly", "part", "start", "back", "present", "live",
+  "idea", "promise", "special",
+    "show", "play", "offer", "tell", "use", "together", "rather", "almost",
+  "every", "anything", "instead", "despite", "quite", "around", "provide",
+  "create", "turn", "run", "less", "easy", "hope",
+  "bad")
+  
+  # Предварительная очистка текста
+  cleaned_text <- data %>%
+    mutate(
+      clean_content = str_to_lower(review_content),
+      clean_content = str_remove_all(clean_content, "[[:punct:]]|\\d"),
+      clean_content = str_remove_all(clean_content, "\\b\\w{1,2}\\b")
+    )
+  
+  # Выявление высокочастотных слов
+  word_stats <- cleaned_text %>%
+    unnest_tokens(word, clean_content) %>%
+    anti_join(stop_words, by = "word") %>%
+    filter(nchar(word) > 2) %>%
+    dplyr::count(word, sort = TRUE) %>%
+    mutate(
+      rank = row_number(),
+      freq_ratio = n / lag(n)
+    )
+  
+  # Отбор слов с высокой частотой и низкой информативностью
+  high_freq_words <- word_stats %>%
+    filter(rank <= 30 | (freq_ratio > 0.85 & rank <= 100)) %>%
+    pull(word)
+  
+  # Формирование итогового списка
+  custom_stops <- unique(c(base_stopwords, movie_terms, high_freq_words))
+  
+  # Очистка списка
+  custom_stops %>%
+    str_replace_all("[[:punct:]]", "") %>%
+    str_trim() %>%
+    unique()
+}
+
+# Генерация стоп-слов
+custom_stopwords <- generate_custom_stopwords(combined_data)
+cat("Кастомные стоп-слова (первые 50):\n")
+head(custom_stopwords, 50) %>% paste(collapse = ", ") %>% cat()
+
+# Улучшенная функция очистки текста
+clean_text <- function(text) {
+  text %>%
+    str_to_lower() %>%
+    str_remove_all("\\n|http\\S+") %>%       # URL и переносы строк
+    str_remove_all("[[:punct:]]") %>%        # Пунктуация
+    str_remove_all("\\d+") %>%               # Числа
+    str_remove_all("\\b\\w{1,2}\\b") %>%     # Короткие слова
+    str_squish()                             # Лишние пробелы
+}
+
+# Оптимизированная обработка данных
+tokenized_data <- combined_data %>%
+  # Базовая очистка текста
+  mutate(clean_content = clean_text(review_content)) %>%
+  # Токенизация и фильтрация
+  unnest_tokens(word, clean_content) %>%
+  filter(
+    !word %in% custom_stopwords,
+    nchar(word) > 2
+  ) %>%
+  # Лемматизация
+  mutate(word = lemmatize_words(word)) %>%
+  # Фильтрация редких слов
+  add_count(word) %>%
+  filter(n >= 10) %>%
+  select(-n)
+tokenized_data <- tokenized_data %>%
+  filter(!tolower(word) %in% custom_stopwords)
+tokenized_data <- tokenized_data %>%
+  filter(word != "go")
+
+processed_data <- tokenized_data %>%
+  # Сборка обратно в текст
+  group_by(review_id, movie_title, review_type, genres, 
+           tomatometer_rating, audience_rating) %>%
+  summarise(clean_content = paste(word, collapse = " "), .groups = "drop") %>%
+  # Фильтрация коротких текстов
+  filter(nchar(clean_content) > 50)
+
+
+```
+
+# Частотный анализ и TF-IDF
+
+```{r, fig.height=8, fig.width=10, out.height="80%", out.width="100%"}
+# Анализ униграмм
+unigram_freq <- tokenized_data %>%
+  dplyr::count(word, sort = TRUE) 
+
+# Визуализация топ-20 слов
+p1 <- unigram_freq %>%
+  head(20) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(n, word)) +
+  geom_col(fill = "steelblue", alpha = 0.8, width = 0.7) +
+  geom_text(aes(label = n), hjust = -0.1, size = 3.5, color = "darkblue") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Топ-20 наиболее частых слов", 
+       subtitle = "После очистки и удаления стоп-слов",
+       x = "Частота", y = "Слово") +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.major.y = element_blank()) + 
+  scale_y_discrete(expand = expansion(add = c(0, 1)))  
+print(unigram_freq)
+# Анализ биграмм
+bigrams <- processed_data %>%
+  unnest_tokens(bigram, clean_content, token = "ngrams", n = 2) %>%
+  separate(bigram, into = c("word1", "word2"), sep = " ") %>%
+  filter(
+    !word1 %in% custom_stopwords,
+    !word2 %in% custom_stopwords,
+    nchar(word1) > 2,
+    nchar(word2) > 2
+  ) %>%
+  unite("bigram", word1, word2, sep = " ") %>%
+  dplyr::count(bigram, sort = TRUE) 
+
+# Визуализация топ-15 биграмм
+p2 <- bigrams %>%
+  head(15) %>%
+  mutate(bigram = reorder(bigram, n)) %>%
+  ggplot(aes(n, bigram)) +
+  geom_col(fill = "coral", alpha = 0.8, width = 0.7) +
+  geom_text(aes(label = n), hjust = -0.1, size = 3.5, color = "darkred") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "Топ-15 наиболее частых биграмм", 
+       subtitle = "После очистки и удаления стоп-слов",
+       x = "Частота", y = "Биграмма") +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.major.y = element_blank(),
+        axis.text.y = element_text(size=12))
+
+# Компоновка графиков униграмм и биграмм
+combined_plot <- p1 / p2 +
+  plot_annotation(title = "Частотный анализ слов и словосочетаний",
+                  subtitle = "Униграммы и биграммы в отзывах кинокритиков",
+                  theme = theme(plot.title = element_text(size = 16, face = "bold"),
+                                plot.subtitle = element_text(size = 14),
+                                axis.text.y = element_text( size=10)))
+
+print(combined_plot)
+
+# TF-IDF анализ
+tf_idf <- tokenized_data %>%
+  dplyr::count(review_id, word) %>%  # review_id как идентификатор документа
+  bind_tf_idf(word, review_id, n)
+
+# Визуализация TF-IDF
+tf_idf_agg <- tf_idf %>%
+  left_join(select(tokenized_data, review_id, review_type), by = "review_id") %>%
+  group_by(review_type, word) %>%
+  summarise(mean_tf_idf = mean(tf_idf), .groups = "drop") %>%
+  group_by(review_type) %>%
+  slice_max(mean_tf_idf, n = 10) %>%
+  ungroup()
+
+# Визуализация 
+tf_idf_plot <- tf_idf_agg %>%
+  mutate(word = reorder_within(word, mean_tf_idf, review_type)) %>%
+  ggplot(aes(mean_tf_idf, word, fill = review_type)) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  geom_text(aes(label = round(mean_tf_idf, 4)), 
+            hjust = -0.1, size = 3, color = "black") +
+  scale_x_continuous(
+    expand = expansion(mult = c(0, 0.3)),  # Больше места справа
+    labels = scales::number_format(accuracy = 0.0001)  # Формат чисел
+  ) +
+  facet_wrap(~review_type, scales = "free", ncol = 2) +
+  scale_y_reordered() +
+  labs(title = "Среднее значение TF-IDF по типу отзыва", 
+       x = "TF-IDF (среднее значение)", y = NULL) +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold"))
+
+print(tf_idf_plot)
+
+```
+
+*Ключевые слова для «Fresh» рецензий:* misfire (промах, неудача) — несмотря на негативное значение, это слово с высоким TF-IDF может указывать на обсуждение конкретных ошибок, но в целом в положительных отзывах такие замечания могут быть редкими или контекстуально оправданными.
+
+que — возможно, это часть выражения, опечатка или специфический термин.
+
+mistake (ошибка), terribly (ужасно), curse (проклятие) — наличие негативных слов в «Fresh» рецензиях может говорить о критическом анализе даже положительных фильмов, где отмечаются отдельные недостатки.
+
+computer, super, dominate, banal, south — слова, отражающие различные аспекты фильмов, возможно, технические (computer), жанровые или стилистические особенности.
+
+*Ключевые слова для «Rotten» рецензий:* que — аналогично, возможна особенность корпуса.
+
+giant, freedom, brilliantly, chill, yarn, alive, blast, breakout, straightforward — эти слова скорее позитивного окраса, что может указывать на иронию, сарказм или обсуждение ожидаемых качеств фильмов, которые не были достигнуты.
+
+Слова с высоким TF-IDF в негативных рецензиях показывают, что критики активно обсуждают определённые аспекты, возможно, связанные с завышенными ожиданиями или противоречиями в фильмах.
+
+*Интерпретация униграмм* Униграммы — это отдельные слова, подсчитанные по частоте появления во всех рецензиях.
+
+Слова interest (интерес) и point (точка, смысл) занимают лидирующие позиции, что отражает стремление критиков обсуждать важные моменты и общий интерес к фильму.
+
+Слова lack (недостаток), move (движение, трогать), charm (очарование) указывают на смешанные оценки, где часто обсуждаются как сильные, так и слабые стороны фильмов.
+
+Общая частота и разнообразие слов показывают, что критики обращают внимание на широкий спектр аспектов, от эмоций до технических деталей.
+
+*Интерпретация биграмм* Биграммы — пары слов, которые часто встречаются вместе, показывающие устойчивые фразы и понятия.
+
+Частые биграммы, такие как "high school", "harry potter", "production design", "science fiction", отражают распространённые темы и жанры, популярные в обсуждении фильмов.
+
+Фразы "directorial debut", "musical number", "social commentary", указывают на важные аспекты, часто упоминаемые в рецензиях: дебют режиссёра, музыкальные сцены, социальные посылы.
+
+Биграммы типа "summer blockbuster" и "balance act" отражают коммерческие и художественные категории фильмов, что свидетельствует о многогранности анализа критиков.
+
+Некоторые биграммы, например "fall short", "hold attention", связаны с оценкой качества и впечатления, полученного от фильма.
+
+# Тематическое моделирование
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(topicmodels)
+
+
+extra_stopwords <- c("like", "good", "find", "seem", "work", "know", "come", "man", 
+                     "something", "end", "take", "give", "make", "look", "really", "see", "get",
+                     "new", "never", "enough", "great", "last", "need", "keep", "right",
+  "become", "two", "many", "think", "little", "leave", "woman", "bring",
+  "though", "full", "year", "another", "try", "thing", "lead", "want",
+  "along", "big", "ever", "long", "perhaps", "first", "second",
+    "yet", "nothing", "day", "often", "whose", "without", "far", "kind",
+  "sometimes", "truly", "part", "start", "back", "present", "live",
+  "idea", "promise", "special",
+    "show", "play", "offer", "tell", "use", "together", "rather", "almost",
+  "every", "anything", "instead", "despite", "quite", "around", "provide",
+  "create", "turn", "run", "less", "easy", "hope",
+  "bad")
+
+all_stopwords <- unique(c(custom_stopwords, extra_stopwords, stopwords("en")))
+
+tokens_df <- processed_data %>%
+  unnest_tokens(word, clean_content) %>%
+  filter(!word %in% all_stopwords,
+         nchar(word) > 2) %>%
+  group_by(word) %>%
+  filter(n() > 5) %>%  
+  ungroup()
+
+
+
+# DTM 
+dtm <- tokens_df %>%
+  count(review_id, word) %>%
+  cast_dtm(review_id, word, n)
+
+# LDA 
+set.seed(123)
+num_topics <- 6 
+lda_model <- LDA(dtm, k = num_topics, control = list(seed = 123))
+
+# Топ-слова по темам
+topics <- tidy(lda_model, matrix = "beta")
+
+top_terms <- topics %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_words_by_topic <- top_terms %>%
+  group_by(topic) %>%
+  summarise(
+    terms = paste(term, collapse = ", "),
+    .groups = "drop"
+  )
+
+print(top_words_by_topic)
+
+# Визуализация 
+lda_plot <- top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(beta, term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  facet_wrap(~ topic, scales = "free_y", ncol = 2) +
+  scale_y_reordered() +
+  labs(
+    title = paste("Топ-10 слов по темам (LDA с", num_topics, "темами)"),
+    subtitle = "Тематическое моделирование отзывов кинокритиков",
+    x = "Вероятность (beta)",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+
+print(lda_plot)
+
+```
+
+*Тема 1: Приключение и эмоции* thrill, beyond, adventure, interest, place, animation, war, effective, dramatic, engage Эта тема явно связана с жанрами и эмоциональным восприятием фильмов. Слова "thrill", "adventure", "dramatic" говорят о динамичных, захватывающих сюжетах. "Animation" и "war" указывают на разнообразие жанров — от анимационных до военных драм. Можно предположить, что эта тема отражает отзывы, акцентирующие внимание на жанровой насыщенности и эмоциональной вовлечённости.
+
+*Тема 2: Политический и социальный контекст* point, portrait, lack, interest, capture, move, powerful, book, engage, political Здесь чувствуется акцент на повествовании и содержании: слова "portrait", "powerful", "book", "political" указывают на фильмы с глубоким смыслом, возможно основанные на реальных событиях или литературе. "Lack" и "interest" могут означать критику за недостаток выразительности или вовлечения. Тема, видимо, связана с драматическими, содержательными фильмами и их оценкой с точки зрения силы сюжета и политической или социальной значимости.
+
+*Тема 3:Насилие и молодёжная тематика или критика* certainly, element, lack, touch, violence, young, away, small, satisfy, point Эта тема содержит слова, связанные с критическим разбором: "lack", "satisfy", "violence". Возможно, здесь сосредоточены отзывы, обсуждающие недостатки фильмов — сценарные ошибки, слабое раскрытие персонажей ("young", "small" могут указывать на героев или возрастной контекст). Слово "violence" предполагает, что некоторые отзывы касаются фильмов с насилием и его восприятия. Это может быть тема критических замечаний, связанных с содержанием и эмоциональным воздействием.
+
+*Тема 4: Тонкая режиссура и камера* craft, camera, interest, subtle, adventure, lack, act, intrigue, solid, truth В этой теме фокус на технических и художественных аспектах: "craft", "camera", "act", "intrigue", "solid". Отзывы, сгруппированные в эту тему, вероятно, оценивают режиссуру, операторскую работу, актёрскую игру и тонкие художественные приёмы. "Lack" и "truth" могут указывать на критику за недостаток правдоподобия или глубины. Тема отражает оценки мастерства и художественных качеств фильмов.
+
+*Тема 5: Динамика и актёрская игра* point, always, interest, pace, shoot, either, high, move, effort, act Здесь тоже присутствуют слова, связанные с ритмом и динамикой фильма: "pace", "shoot", "move", "effort". Можно предположить, что отзывы этой темы обсуждают темп повествования, качество съёмок и актёрскую работу. "Point", "always" могут означать частые обращения к ключевым моментам сюжета или постоянным элементам. Эта тема скорее про восприятие динамики и технического исполнения.
+
+*Тема 6: Разбор посылов фильма* political, simply, put, balance, expect, old, point, question, please, young Эта тема явно касается политических и социальных аспектов: "political", "balance", "expect", "question". Возможно, сюда входят отзывы, обсуждающие социальные посылы фильмов, их актуальность, соотношение с ожиданиями зрителей. "Old" и "young" могут означать сравнения поколений или возрастные аспекты восприятия. Тема раскрывает критику и обсуждение смыслового и идеологического содержания.
+
+# Анализ тональности
+
+```{r}
+
+# Загружаем словари
+afinn <- get_sentiments("afinn")
+bing <- get_sentiments("bing") %>%
+  mutate(value = ifelse(sentiment == "positive", 1, -1)) %>% 
+  select(word, value)
+
+
+# соединяем словари
+combined_dict <- bind_rows(
+  afinn  %>% select(word, value),
+  bing
+) %>%
+  group_by(word) %>%
+  summarise(sentiment_score = mean(value, na.rm = TRUE), .groups = "drop")
+
+# Считаем тональность по отзывам
+sentiment_scores <- tokenized_data %>%
+  left_join(combined_dict, by = "word") %>%
+  group_by(review_id, review_type, top_critic) %>%
+  summarise(sentiment = mean(sentiment_score, na.rm = TRUE), .groups = "drop") %>%
+  mutate(sentiment = ifelse(is.nan(sentiment), 0, sentiment))
+
+
+# График распределения по отзывам
+dist_p <- ggplot(sentiment_scores, aes(x = sentiment, fill = review_type)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("fresh" = "#1f77b4", "rotten" = "#d62728")) +
+  labs(title = "Распределение тональности (2 словаря)",
+       x = "Средняя тональность", y = "Плотность") +
+  theme_minimal()
+print(dist_p)
+# Топ-слов по тональности
+word_sentiment <- tokenized_data %>%
+  left_join(combined_dict, by = "word") %>%
+  filter(!is.na(sentiment_score)) %>%
+  count(word, sentiment_score, sort = TRUE)
+
+top_pos <- word_sentiment %>% filter(sentiment_score > 0) %>% slice_max(n, n = 10)
+top_neg <- word_sentiment %>% filter(sentiment_score < 0) %>% slice_max(n, n = 10)
+
+positive_p <- ggplot(top_pos, aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "#1f77b4") +
+  coord_flip() +
+  labs(title = "Топ позитивных слов", x = NULL, y = "Частота") +
+  theme_minimal()
+
+negative_p <- ggplot(top_neg, aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "#d62728") +
+  coord_flip() +
+  labs(title = "Топ негативных слов", x = NULL, y = "Частота") +
+  theme_minimal()
+
+print(positive_p)
+print(negative_p)
+
+summary(sentiment_scores$sentiment)
+sentiment_scores %>%
+  group_by(review_type) %>%
+  summarise(
+    mean_sentiment = mean(sentiment),
+    median_sentiment = median(sentiment),
+    sd_sentiment = sd(sentiment),
+    .groups = "drop"
+  )
+```
+
+Fresh (Положительные отзывы):
+
+-   Средняя тональность: +0.326 — в среднем отзывы этой группы имеют положительный эмоциональный оттенок, что логично для «свежих» (Fresh) отзывов. Значение выше нуля подтверждает, что тональность позитивная.
+
+-   Медиана тональности: 0 — половина отзывов имеет нейтральный или слабоположительный настрой. Это может указывать на то, что даже в положительных отзывах не всегда присутствует ярко выраженный позитив, а многие отзывы довольно нейтральны.
+
+-   Стандартное отклонение: 1.03 — значительная дисперсия, то есть внутри группы есть как отзывы с очень позитивным, так и с более нейтральным или слабо выраженным настроением.
+
+2.  Rotten (Отрицательные отзывы):
+
+-   Средняя тональность: -0.13 — средний балл смещён в отрицательную сторону, что соответствует ожиданиям для негативных отзывов. Значение ближе к нулю, чем у Fresh, что говорит о том, что негатив не такой выраженный или более разбросан.
+
+-   Медиана: 0 — половина отзывов нейтральна или чуть негативна, что тоже показывает, что не все отзывы сильно отрицательные, много отзывов с нейтральным оттенком.
+
+-   Стандартное отклонение: 0.999 — дисперсия примерно равна дисперсии Fresh, то есть разброс тональности схож.
+
+*Разделение на Fresh и Rotten работает, но не идеально: обе группы содержат много отзывов с нейтральной тональностью, медианы равны нулю. Это может быть связано с особенностями языка отзывов, где люди часто выражают умеренные эмоции, или с тем, что некоторые отзывы не содержат ярко выраженных эмоциональных маркеров. Средние значения тональности подтверждают, что Fresh в среднем позитивнее Rotten, но разброс тональности в обеих группах значительный и похожий. Общая тональность смещена в положительную сторону, что может указывать на позитивную предвзятость в данных или на то, что пользователи чаще пишут умеренно позитивные отзывы.*
+
+# Тональность рецензии в зависимости от того топ критик или нет
+
+```{r}
+dist_critic <- ggplot(sentiment_scores, aes(x = sentiment, fill = as.factor(top_critic))) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("TRUE" = "#1f77b4", "FALSE" = "#d62728"),
+                    name = "Top Critic") +
+  labs(title = "Распределение тональности по статусу критика",
+       x = "Средняя тональность", y = "Плотность") +
+  theme_minimal()
+print(dist_critic)
+# 3. Вычисление средней тональности по группам
+sentiment_by_group <- sentiment_scores %>%
+  group_by(top_critic) %>%
+  summarise(
+    mean_sentiment = mean(sentiment, na.rm = TRUE),
+    sd_sentiment = sd(sentiment, na.rm = TRUE),
+    count = n()
+  )
+print(sentiment_by_group)
+
+# 4. t-тест для проверки статистической значимости разницы
+t_test_result <- t.test(sentiment ~ top_critic, data = sentiment_scores)
+print(t_test_result)
+
+```
+
+Различия в тональности статистически не значимы. Также Распределение тональности у топ-критиков имеет меньший разброс, так что они все плюс-минус пишут похоже.
+
+Средняя тональность у не top-критиков ≈ 0.244, а у top-критиков ≈ 0.186.
+
+p-value ≈ 0.021 → разница статистически значима на уровне значимости 5% (p \< 0.05).
+
+Доверительный интервал [0.0088, 0.1067] говорит, что не top-критики в среднем оценивают фильмы чуть более позитивно на 0.009–0.107 баллов по твоей метрике.
+
+То есть получается такой вывод: Top-критики строже и используют в среднем более негативную лексику, чем обычные критики.
+
+# Можно ли предсказать "Fresh" или "Rotten" по тексту рецензии
+
+```{r message=FALSE, warning=FALSE}
+#   Преобразуем текст в матрицу TF-IDF
+revies_sample <- reviews %>% slice_sample(n=80000)
+corpus <- VCorpus(VectorSource(revies_sample$review_content))
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeNumbers)
+corpus <- tm_map(corpus, removeWords, custom_stopwords)
+corpus <- tm_map(corpus, stripWhitespace)
+
+
+dtm <- DocumentTermMatrix(corpus, control = list(weighting = weightTfIdf))
+dtm <- removeSparseTerms(dtm, 0.99) 
+
+#  Приводим к data.frame
+data_matrix <- as.data.frame(as.matrix(dtm))
+data_matrix$rating <- as.factor(revies_sample$review_type)
+
+trainIndex <- createDataPartition(data_matrix$rating, p = 0.8, list = FALSE)
+trainData <- data_matrix[trainIndex, ]
+testData  <- data_matrix[-trainIndex, ]
+
+
+# Логистическая регрессия
+model <- glm(rating ~ ., data = trainData, family = "binomial")
+
+# Предсказания
+pred_probs <- predict(model, newdata = testData, type = "response")
+pred_labels <- ifelse(pred_probs > 0.5, "Fresh", "Rotten")
+
+# Оценка точности
+confusionMatrix(factor(pred_labels, levels = c("Rotten", "Fresh")),
+                testData$rating)
+```
+
+Данная модель плохо предсказывает, всего в 36% угадывает, в основном отзывы отрицательные поэтому выбирает "безопасный" вариант и говорит что отзыв "Rotten".
